@@ -134,8 +134,8 @@ const (
 	// podUpdateWorkerSizes assumes that in most cases pod will be handled by monitorNodeHealth pass.
 	// Pod update workers will only handle lagging cache pods. 4 workers should be enough.
 	podUpdateWorkerSize = 4
-	// nodeUpdateWorkerSize defines the size of workers for node update or/and pod update.
-	nodeUpdateWorkerSize = 8
+	// monitorNodeHealthWorkerSize is the number of workers monitorNodeHealth uses to update node health.
+	monitorNodeHealthWorkerSize = 8
 )
 
 // labelReconcileInfo lists Node labels to reconcile, and how to reconcile them.
@@ -295,16 +295,17 @@ type Controller struct {
 	//    value takes longer for user to see up-to-date node health.
 	nodeMonitorGracePeriod time.Duration
 
-	// Number of workers Controller uses to process node monitor health updates.
-	// Defaults to scheduler.UpdateWorkerSize.
-	nodeUpdateWorkerSize int
+	// Number of workers monitorNodeHealth uses to update node health.
+	monitorNodeHealthWorkerSize int
+	// Number of workers that process nodeUpdateQueue (NoSchedule taints and labels).
+	nodeUpdateQueueWorkerSize int
 
 	evictionLimiterQPS          float32
 	secondaryEvictionLimiterQPS float32
 	largeClusterThreshold       int32
 	unhealthyZoneThreshold      float32
 
-	nodeUpdateQueue workqueue.TypedInterface[string]
+	nodeUpdateQueue workqueue.TypedRateLimitingInterface[string]
 	podUpdateQueue  workqueue.TypedRateLimitingInterface[podUpdateItem]
 }
 
@@ -322,6 +323,7 @@ type ControllerOptions struct {
 	SecondaryEvictionLimiterQPS float32
 	LargeClusterThreshold       int32
 	UnhealthyZoneThreshold      float32
+	NodeUpdateQueueWorkerSize   int
 }
 
 func (o *ControllerOptions) validate() error {
@@ -337,6 +339,9 @@ func (o *ControllerOptions) validate() error {
 	}
 	if o.DaemonSetInformer == nil {
 		errs = append(errs, errors.New("DaemonSetInformer cannot be nil"))
+	}
+	if o.NodeUpdateQueueWorkerSize < 1 {
+		errs = append(errs, fmt.Errorf("NodeUpdateQueueWorkerSize must be at least 1, got %d", o.NodeUpdateQueueWorkerSize))
 	}
 	return errors.Join(errs...)
 }
@@ -365,7 +370,8 @@ func NewNodeLifecycleController(ctx context.Context, opts ControllerOptions) (*C
 		nodeMonitorPeriod:           opts.NodeMonitorPeriod,
 		nodeStartupGracePeriod:      opts.NodeStartupGracePeriod,
 		nodeMonitorGracePeriod:      opts.NodeMonitorGracePeriod,
-		nodeUpdateWorkerSize:        nodeUpdateWorkerSize,
+		monitorNodeHealthWorkerSize: monitorNodeHealthWorkerSize,
+		nodeUpdateQueueWorkerSize:   opts.NodeUpdateQueueWorkerSize,
 		zoneNoExecuteTainter:        make(map[string]*scheduler.RateLimitedTimedQueue),
 		nodesToRetry:                sync.Map{},
 		zoneStates:                  make(map[string]ZoneState),
@@ -373,7 +379,13 @@ func NewNodeLifecycleController(ctx context.Context, opts ControllerOptions) (*C
 		secondaryEvictionLimiterQPS: opts.SecondaryEvictionLimiterQPS,
 		largeClusterThreshold:       opts.LargeClusterThreshold,
 		unhealthyZoneThreshold:      opts.UnhealthyZoneThreshold,
-		nodeUpdateQueue:             workqueue.NewTypedWithConfig(workqueue.TypedQueueConfig[string]{Name: "node_lifecycle_controller"}),
+		nodeUpdateQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: new(klog.FromContext(ctx)),
+				Name:   "node_lifecycle_controller",
+			},
+		),
 		podUpdateQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[podUpdateItem](),
 			workqueue.TypedRateLimitingQueueConfig[podUpdateItem]{
@@ -427,8 +439,10 @@ func NewNodeLifecycleController(ctx context.Context, opts ControllerOptions) (*C
 			nc.nodeUpdateQueue.Add(node.Name)
 			return nil
 		}),
-		UpdateFunc: controllerutil.CreateUpdateNodeHandler(func(_, newNode *v1.Node) error {
-			nc.nodeUpdateQueue.Add(newNode.Name)
+		UpdateFunc: controllerutil.CreateUpdateNodeHandler(func(oldNode, newNode *v1.Node) error {
+			if nodeUpdateNeedsProcessing(oldNode, newNode) {
+				nc.nodeUpdateQueue.Add(newNode.Name)
+			}
 			return nil
 		}),
 		DeleteFunc: controllerutil.CreateDeleteNodeHandler(logger, func(node *v1.Node) error {
@@ -486,7 +500,7 @@ func (nc *Controller) Run(ctx context.Context) {
 	}
 
 	// Start workers to reconcile labels and/or update NoSchedule taint for nodes.
-	for i := 0; i < nodeUpdateWorkerSize; i++ {
+	for i := 0; i < nc.nodeUpdateQueueWorkerSize; i++ {
 		// Thanks to "workqueue", each worker just need to get item from queue, because
 		// the item is flagged when got from queue: if new event come, the new item will
 		// be re-queued until "Done", so no more than one worker handle the same item and
@@ -520,7 +534,6 @@ func (nc *Controller) Run(ctx context.Context) {
 }
 
 func (nc *Controller) doNodeProcessingPassWorker(ctx context.Context) {
-	logger := klog.FromContext(ctx)
 	for {
 		obj, shutdown := nc.nodeUpdateQueue.Get()
 		// "nodeUpdateQueue" will be shutdown when "stopCh" closed;
@@ -528,19 +541,66 @@ func (nc *Controller) doNodeProcessingPassWorker(ctx context.Context) {
 		if shutdown {
 			return
 		}
-		nodeName := obj
-		if err := nc.doNoScheduleTaintingPass(ctx, nodeName); err != nil {
-			logger.Error(err, "Failed to taint NoSchedule on node, requeue it", "node", klog.KRef("", nodeName))
-			// TODO(k82cn): Add nodeName back to the queue
-		}
-		// TODO: re-evaluate whether there are any labels that need to be
-		// reconcile in 1.19. Remove this function if it's no longer necessary.
-		if err := nc.reconcileNodeLabels(ctx, nodeName); err != nil {
-			logger.Error(err, "Failed to reconcile labels for node, requeue it", "node", klog.KRef("", nodeName))
-			// TODO(yujuhong): Add nodeName back to the queue
-		}
-		nc.nodeUpdateQueue.Done(nodeName)
+		nc.processNodeUpdate(ctx, obj)
 	}
+}
+
+// processNodeUpdate reconciles the NoSchedule taints and the labels of one node
+// and requeues the node with rate limiting if either step fails.
+func (nc *Controller) processNodeUpdate(ctx context.Context, nodeName string) {
+	logger := klog.FromContext(ctx)
+	defer nc.nodeUpdateQueue.Done(nodeName)
+
+	var errs []error
+	if err := nc.doNoScheduleTaintingPass(ctx, nodeName); err != nil {
+		logger.Error(err, "Failed to taint NoSchedule on node, requeue it", "node", klog.KRef("", nodeName))
+		errs = append(errs, err)
+	}
+	// TODO: re-evaluate whether there are any labels that need to be
+	// reconcile in 1.19. Remove this function if it's no longer necessary.
+	if err := nc.reconcileNodeLabels(ctx, nodeName); err != nil {
+		logger.Error(err, "Failed to reconcile labels for node, requeue it", "node", klog.KRef("", nodeName))
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		nc.nodeUpdateQueue.AddRateLimited(nodeName)
+		return
+	}
+	nc.nodeUpdateQueue.Forget(nodeName)
+}
+
+// nodeUpdateNeedsProcessing reports whether a node update changes a field that
+// doNoScheduleTaintingPass or reconcileNodeLabels read, or is an informer resync.
+func nodeUpdateNeedsProcessing(oldNode, newNode *v1.Node) bool {
+	if oldNode.ResourceVersion == newNode.ResourceVersion {
+		return true
+	}
+	if oldNode.Spec.Unschedulable != newNode.Spec.Unschedulable {
+		return true
+	}
+	if !apiequality.Semantic.DeepEqual(oldNode.Spec.Taints, newNode.Spec.Taints) {
+		return true
+	}
+	for conditionType := range nodeConditionToTaintKeyStatusMap {
+		_, oldCondition := controllerutil.GetNodeCondition(&oldNode.Status, conditionType)
+		_, newCondition := controllerutil.GetNodeCondition(&newNode.Status, conditionType)
+		if (oldCondition == nil) != (newCondition == nil) {
+			return true
+		}
+		if oldCondition != nil && oldCondition.Status != newCondition.Status {
+			return true
+		}
+	}
+	for _, r := range labelReconcileInfo {
+		for _, key := range []string{r.primaryKey, r.secondaryKey} {
+			oldValue, oldExists := oldNode.Labels[key]
+			newValue, newExists := newNode.Labels[key]
+			if oldExists != newExists || oldValue != newValue {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, nodeName string) error {
@@ -555,7 +615,11 @@ func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, nodeName str
 
 	// Map node's condition to Taints.
 	var taints []v1.Taint
+	hasReadyCondition := false
 	for _, condition := range node.Status.Conditions {
+		if condition.Type == v1.NodeReady {
+			hasReadyCondition = true
+		}
 		if taintMap, found := nodeConditionToTaintKeyStatusMap[condition.Type]; found {
 			if taintKey, found := taintMap[condition.Status]; found {
 				taints = append(taints, v1.Taint{
@@ -564,6 +628,14 @@ func (nc *Controller) doNoScheduleTaintingPass(ctx context.Context, nodeName str
 				})
 			}
 		}
+	}
+	if !hasReadyCondition {
+		// A node without a Ready condition is not ready. Keep the taint that the
+		// TaintNodesByCondition admission plugin added at creation.
+		taints = append(taints, v1.Taint{
+			Key:    v1.TaintNodeNotReady,
+			Effect: v1.TaintEffectNoSchedule,
+		})
 	}
 	if node.Spec.Unschedulable {
 		// If unschedulable, append related taint.
@@ -793,7 +865,7 @@ func (nc *Controller) monitorNodeHealth(ctx context.Context) error {
 	// can take a while if we're processing each node serially as well. So we
 	// process them with bounded concurrency instead, since most of the time is
 	// spent waiting on io.
-	workqueue.ParallelizeUntil(ctx, nc.nodeUpdateWorkerSize, len(nodes), updateNodeFunc)
+	workqueue.ParallelizeUntil(ctx, nc.monitorNodeHealthWorkerSize, len(nodes), updateNodeFunc)
 
 	nc.handleDisruption(ctx, zoneToNodeConditions, nodes)
 

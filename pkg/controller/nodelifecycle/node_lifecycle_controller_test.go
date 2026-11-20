@@ -28,11 +28,13 @@ import (
 	coordv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
@@ -61,6 +63,7 @@ const (
 	testRateLimiterQPS         = float32(100000)
 	testLargeClusterThreshold  = 20
 	testUnhealthyThreshold     = float32(0.55)
+	testNodeUpdateQueueWorkers = 8
 )
 
 func alwaysReady() bool { return true }
@@ -166,6 +169,7 @@ func newNodeLifecycleControllerFromClient(
 		SecondaryEvictionLimiterQPS: secondaryEvictionLimiterQPS,
 		LargeClusterThreshold:       largeClusterThreshold,
 		UnhealthyZoneThreshold:      unhealthyZoneThreshold,
+		NodeUpdateQueueWorkerSize:   testNodeUpdateQueueWorkers,
 	})
 	if err != nil {
 		return nil, err
@@ -2219,7 +2223,7 @@ func TestMonitorNodeHealthMarkPodsNotReadyWithWorkerSize(t *testing.T) {
 	table := []struct {
 		workers int
 	}{
-		{workers: 0}, // will default to scheduler.UpdateWorkerSize
+		{workers: 0}, // will default to monitorNodeHealthWorkerSize
 		{workers: 1},
 	}
 
@@ -2246,7 +2250,7 @@ func TestMonitorNodeHealthMarkPodsNotReadyWithWorkerSize(t *testing.T) {
 		nodeController.recorder = testutil.NewFakeRecorder()
 		nodeController.getPodsAssignedToNode = fakeGetPodsAssignedToNode(fakeNodeHandler.Clientset)
 		if item.workers != 0 {
-			nodeController.nodeUpdateWorkerSize = item.workers
+			nodeController.monitorNodeHealthWorkerSize = item.workers
 		}
 		if err := nodeController.syncNodeStore(fakeNodeHandler); err != nil {
 			t.Errorf("unexpected error: %v", err)
@@ -3532,6 +3536,62 @@ func TestTaintsNodeByCondition(t *testing.T) {
 			},
 			ExpectedTaints: []*v1.Taint{unreachableTaint},
 		},
+		{
+			Name: "No Ready condition keeps the not-ready taint",
+			Node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{*notReadyTaint},
+				},
+			},
+			ExpectedTaints: []*v1.Taint{notReadyTaint},
+		},
+		{
+			Name: "No Ready condition adds the not-ready taint",
+			Node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeNetworkUnavailable,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			ExpectedTaints: []*v1.Taint{notReadyTaint},
+		},
+		{
+			Name: "Ready is true removes the not-ready taint",
+			Node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node0",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{*notReadyTaint},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionTrue,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			ExpectedTaints: []*v1.Taint{},
+		},
 	}
 
 	for _, test := range tests {
@@ -3780,6 +3840,290 @@ func TestReconcileNodeLabels(t *testing.T) {
 				t.Errorf("%s: label %q: expected value %q, got value %q", test.Name, key, expectedValue, actualValue)
 			}
 		}
+	}
+}
+
+// TestProcessNodeUpdateRequeuesOnFailure verifies that a node whose taint
+// patch fails is requeued and retried.
+func TestProcessNodeUpdateRequeuesOnFailure(t *testing.T) {
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "node0",
+			CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		Spec: v1.NodeSpec{
+			Taints: []v1.Taint{
+				{Key: v1.TaintNodeNotReady, Effect: v1.TaintEffectNoSchedule},
+			},
+		},
+		Status: v1.NodeStatus{
+			Conditions: []v1.NodeCondition{
+				{
+					Type:               v1.NodeReady,
+					Status:             v1.ConditionTrue,
+					LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+					LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+		},
+	}
+	kubeClient := fake.NewSimpleClientset(node)
+	// The first patch fails with a non-conflict error; the second succeeds.
+	failedPatches := 0
+	kubeClient.PrependReactor("patch", "nodes", func(action testcore.Action) (bool, runtime.Object, error) {
+		if failedPatches == 0 {
+			failedPatches++
+			return true, nil, apierrors.NewTooManyRequests("too many requests", 1)
+		}
+		return false, nil, nil
+	})
+
+	tCtx := ktesting.Init(t)
+	nodeController, err := newNodeLifecycleControllerFromClient(
+		tCtx,
+		kubeClient,
+		testRateLimiterQPS,
+		testRateLimiterQPS,
+		testLargeClusterThreshold,
+		testUnhealthyThreshold,
+		testNodeMonitorGracePeriod,
+		testNodeStartupGracePeriod,
+		testNodeMonitorPeriod,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := nodeController.nodeInformer.Informer().GetStore().Add(node); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	nodeController.nodeUpdateQueue.Add(node.Name)
+	item, shutdown := nodeController.nodeUpdateQueue.Get()
+	if shutdown {
+		t.Fatal("queue shut down unexpectedly")
+	}
+	nodeController.processNodeUpdate(tCtx, item)
+	if failedPatches != 1 {
+		t.Fatalf("expected the first patch to fail, got %d failed patches", failedPatches)
+	}
+	if got := nodeController.nodeUpdateQueue.NumRequeues(node.Name); got != 1 {
+		t.Fatalf("expected 1 requeue of %s after the failed patch, got %d", node.Name, got)
+	}
+	// The retry is added after the rate limiter delay.
+	if err := wait.PollUntilContextTimeout(tCtx, 10*time.Millisecond, wait.ForeverTestTimeout, true, func(context.Context) (bool, error) {
+		return nodeController.nodeUpdateQueue.Len() == 1, nil
+	}); err != nil {
+		t.Fatalf("node %s was not requeued after the failed patch: %v", node.Name, err)
+	}
+
+	item, shutdown = nodeController.nodeUpdateQueue.Get()
+	if shutdown {
+		t.Fatal("queue shut down unexpectedly")
+	}
+	nodeController.processNodeUpdate(tCtx, item)
+	if got := nodeController.nodeUpdateQueue.NumRequeues(node.Name); got != 0 {
+		t.Fatalf("expected the requeue count of %s to be reset after the retry, got %d", node.Name, got)
+	}
+	if got := nodeController.nodeUpdateQueue.Len(); got != 0 {
+		t.Fatalf("expected an empty queue after the retry, got %d items", got)
+	}
+	updatedNode, err := kubeClient.CoreV1().Nodes().Get(tCtx, node.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if taintutils.TaintExists(updatedNode.Spec.Taints, &v1.Taint{Key: v1.TaintNodeNotReady, Effect: v1.TaintEffectNoSchedule}) {
+		t.Errorf("expected the retry to remove the not-ready taint, got taints %v", updatedNode.Spec.Taints)
+	}
+}
+
+func TestNodeUpdateNeedsProcessing(t *testing.T) {
+	baseNode := func() *v1.Node {
+		return &v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "node0",
+				ResourceVersion: "1",
+				Labels: map[string]string{
+					v1.LabelOSStable:     "linux",
+					v1.LabelArchStable:   "amd64",
+					v1.LabelTopologyZone: "zone1",
+				},
+				Annotations: map[string]string{"a": "1"},
+			},
+			Spec: v1.NodeSpec{
+				Taints: []v1.Taint{
+					{Key: "example.com/dedicated", Value: "a", Effect: v1.TaintEffectNoSchedule},
+				},
+			},
+			Status: v1.NodeStatus{
+				Conditions: []v1.NodeCondition{
+					{
+						Type:               v1.NodeReady,
+						Status:             v1.ConditionFalse,
+						LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+					},
+					{
+						Type:               v1.NodeMemoryPressure,
+						Status:             v1.ConditionFalse,
+						LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+					},
+				},
+			},
+		}
+	}
+	// newVersion returns a modified copy of the node with a new resourceVersion.
+	newVersion := func(mutate func(node *v1.Node)) *v1.Node {
+		node := baseNode()
+		node.ResourceVersion = "2"
+		mutate(node)
+		return node
+	}
+
+	tests := []struct {
+		name     string
+		oldNode  *v1.Node
+		newNode  *v1.Node
+		expected bool
+	}{
+		{
+			name:     "resync of the same object",
+			oldNode:  baseNode(),
+			newNode:  baseNode(),
+			expected: true,
+		},
+		{
+			name:    "heartbeat only",
+			oldNode: baseNode(),
+			newNode: newVersion(func(node *v1.Node) {
+				node.Status.Conditions[0].LastHeartbeatTime = metav1.Date(2015, 1, 1, 12, 1, 0, 0, time.UTC)
+			}),
+			expected: false,
+		},
+		{
+			name:    "status fields outside the conditions",
+			oldNode: baseNode(),
+			newNode: newVersion(func(node *v1.Node) {
+				node.Status.Images = []v1.ContainerImage{{Names: []string{"image:1"}}}
+				node.Status.Addresses = []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: "10.0.0.1"}}
+			}),
+			expected: false,
+		},
+		{
+			name:     "annotation",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Annotations["a"] = "2" }),
+			expected: false,
+		},
+		{
+			name:     "label that is not reconciled",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Labels[v1.LabelTopologyZone] = "zone2" }),
+			expected: false,
+		},
+		{
+			name:     "spec fields outside taints and unschedulable",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Spec.ProviderID = "gce://p/z/node0"; node.Spec.PodCIDR = "10.0.0.0/24" }),
+			expected: false,
+		},
+		{
+			name:    "condition that is not mapped to a taint",
+			oldNode: baseNode(),
+			newNode: newVersion(func(node *v1.Node) {
+				node.Status.Conditions = append(node.Status.Conditions, v1.NodeCondition{Type: "KernelDeadlock", Status: v1.ConditionTrue})
+			}),
+			expected: false,
+		},
+		{
+			name:     "Ready becomes True",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Status.Conditions[0].Status = v1.ConditionTrue }),
+			expected: true,
+		},
+		{
+			name:     "Ready becomes Unknown",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Status.Conditions[0].Status = v1.ConditionUnknown }),
+			expected: true,
+		},
+		{
+			name:     "Ready condition added",
+			oldNode:  newVersion(func(node *v1.Node) { node.ResourceVersion = "1"; node.Status.Conditions = nil }),
+			newNode:  baseNode(),
+			expected: true,
+		},
+		{
+			name:     "Ready condition removed",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Status.Conditions = node.Status.Conditions[1:] }),
+			expected: true,
+		},
+		{
+			name:     "MemoryPressure becomes True",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Status.Conditions[1].Status = v1.ConditionTrue }),
+			expected: true,
+		},
+		{
+			name:    "DiskPressure condition added",
+			oldNode: baseNode(),
+			newNode: newVersion(func(node *v1.Node) {
+				node.Status.Conditions = append(node.Status.Conditions, v1.NodeCondition{Type: v1.NodeDiskPressure, Status: v1.ConditionFalse})
+			}),
+			expected: true,
+		},
+		{
+			name:     "unschedulable",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Spec.Unschedulable = true }),
+			expected: true,
+		},
+		{
+			name:     "taint removed",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Spec.Taints = nil }),
+			expected: true,
+		},
+		{
+			name:    "taint added",
+			oldNode: baseNode(),
+			newNode: newVersion(func(node *v1.Node) {
+				node.Spec.Taints = append(node.Spec.Taints, v1.Taint{Key: v1.TaintNodeNotReady, Effect: v1.TaintEffectNoSchedule})
+			}),
+			expected: true,
+		},
+		{
+			name:     "taint value changed",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Spec.Taints[0].Value = "b" }),
+			expected: true,
+		},
+		{
+			name:     "stable OS label changed",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Labels[v1.LabelOSStable] = "windows" }),
+			expected: true,
+		},
+		{
+			name:     "beta arch label added",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { node.Labels[kubeletapis.LabelArch] = "arm64" }),
+			expected: true,
+		},
+		{
+			name:     "stable arch label removed",
+			oldNode:  baseNode(),
+			newNode:  newVersion(func(node *v1.Node) { delete(node.Labels, v1.LabelArchStable) }),
+			expected: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := nodeUpdateNeedsProcessing(test.oldNode, test.newNode); got != test.expected {
+				t.Errorf("nodeUpdateNeedsProcessing() = %v, expected %v", got, test.expected)
+			}
+		})
 	}
 }
 
@@ -4172,6 +4516,7 @@ func TestNewNodeLifecycleControllerValidation(t *testing.T) {
 			SecondaryEvictionLimiterQPS: testRateLimiterQPS,
 			LargeClusterThreshold:       testLargeClusterThreshold,
 			UnhealthyZoneThreshold:      testUnhealthyThreshold,
+			NodeUpdateQueueWorkerSize:   testNodeUpdateQueueWorkers,
 		}, factory
 	}
 
@@ -4210,6 +4555,13 @@ func TestNewNodeLifecycleControllerValidation(t *testing.T) {
 			name: "nil DaemonSetInformer",
 			mutate: func(_ *testing.T, _ context.Context, opts *ControllerOptions, _ informers.SharedInformerFactory) {
 				opts.DaemonSetInformer = nil
+			},
+			wantErr: true,
+		},
+		{
+			name: "zero NodeUpdateQueueWorkerSize",
+			mutate: func(_ *testing.T, _ context.Context, opts *ControllerOptions, _ informers.SharedInformerFactory) {
+				opts.NodeUpdateQueueWorkerSize = 0
 			},
 			wantErr: true,
 		},

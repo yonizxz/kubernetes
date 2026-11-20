@@ -92,6 +92,7 @@ func TestTaintNodeByCondition(t *testing.T) {
 		SecondaryEvictionLimiterQPS: 100,
 		LargeClusterThreshold:       100,
 		UnhealthyZoneThreshold:      100,
+		NodeUpdateQueueWorkerSize:   8,
 	})
 	if err != nil {
 		t.Errorf("Failed to create node controller: %v", err)

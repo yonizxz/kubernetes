@@ -125,6 +125,7 @@ func TestEvictionForNoExecuteTaintAddedByUser(t *testing.T) {
 				SecondaryEvictionLimiterQPS: 100,
 				LargeClusterThreshold:       50,
 				UnhealthyZoneThreshold:      0.55,
+				NodeUpdateQueueWorkerSize:   8,
 			})
 			if err != nil {
 				t.Fatalf("Failed to create node controller: %v", err)
@@ -293,6 +294,7 @@ func TestTaintBasedEvictions(t *testing.T) {
 				SecondaryEvictionLimiterQPS: 100,
 				LargeClusterThreshold:       50,
 				UnhealthyZoneThreshold:      0.55,
+				NodeUpdateQueueWorkerSize:   8,
 			})
 			if err != nil {
 				t.Fatalf("Failed to create node controller: %v", err)
